@@ -377,6 +377,15 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 		resp.Header.Del("Content-Security-Policy")
 	}
 
+	// HTML-only transformations (applyRules + rewriteHtml) blow up non-HTML
+	// responses — XML sitemaps get their <?xml?> PI silently converted to a
+	// comment and the whole payload wrapped in <html><head><body> by
+	// goquery, JSON/CSS/JS get corrupted by the string-based `href="/`
+	// replacements. Content-Type sniffing keeps them intact.
+	if !isHTMLResponse(resp) {
+		return string(bodyB), req, resp, nil
+	}
+
 	// Apply ruleset modifications (regexRules + injections) BEFORE URL rewriting:
 	// rewriteHtml renames `src="/..."` to `script="..."` on relative-URL script tags,
 	// which would otherwise prevent our `<script[^>]*src="..."` regex patterns from
@@ -384,6 +393,31 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 	body := applyRules(string(bodyB), rule)
 	body = rewriteHtml([]byte(body), u, rule)
 	return body, req, resp, nil
+}
+
+// isHTMLResponse reports whether the response's Content-Type indicates an
+// HTML body. Rewriting is only safe for HTML — XML, JSON, CSS, JS, images,
+// binary payloads all get mangled if we run the HTML rewriter over them.
+// Missing Content-Type is treated as HTML for backwards compatibility (some
+// origins omit the header; the pre-existing behavior was to always rewrite).
+func isHTMLResponse(resp *http.Response) bool {
+	if resp == nil {
+		return true
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+	// Content-Type may include parameters like "text/html; charset=utf-8".
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	// Explicitly HTML.
+	if ct == "text/html" || ct == "application/xhtml+xml" {
+		return true
+	}
+	return false
 }
 
 func rewriteHtml(bodyB []byte, u *url.URL, rule ruleset.Rule) string {
