@@ -407,7 +407,87 @@ func rewriteHtml(bodyB []byte, u *url.URL, rule ruleset.Rule) string {
 	body = strings.ReplaceAll(body, "url('/", "url('"+proxyPrefix)
 	body = strings.ReplaceAll(body, "url(/", "url("+proxyPrefix)
 	body = strings.ReplaceAll(body, "href=\"https://"+u.Host, "href=\""+proxyPrefix)
+
+	// Rewrite every <a>/<area> href through the proxy — catches the cases the
+	// string ReplaceAlls above miss (protocol-relative //cdn/x, cross-domain
+	// https://other.com/x, and single-quoted href='...'). Result is always a
+	// relative path (starts with basePath+"/") so it stays on the proxy host.
+	body = rewriteAnchorHrefs(body, u)
 	return body
+}
+
+// proxifyHref returns an origin-relative proxy path for an anchor href, or ""
+// if the href should be left alone. base is the page's own URL (used to
+// resolve relative and protocol-relative references).
+//
+// Rewrites:
+//
+//	/foo                            -> {basePath}/https://{base.Host}/foo
+//	https://any.host/x              -> {basePath}/https://any.host/x
+//	//cdn.example/x                 -> {basePath}/https://cdn.example/x
+//	./x, ../x, foo?bar              -> resolved against base, then proxified
+//
+// Skipped (returned as empty string):
+//
+//	#anchor, javascript:, mailto:, tel:, data:, blob:, sms:, callto:
+//	anything already prefixed with basePath+"/http"
+//	non-http(s) schemes after resolution
+func proxifyHref(href string, base *url.URL) string {
+	h := strings.TrimSpace(href)
+	if h == "" || strings.HasPrefix(h, "#") {
+		return ""
+	}
+	lc := strings.ToLower(h)
+	for _, p := range []string{"javascript:", "mailto:", "tel:", "data:", "blob:", "sms:", "callto:", "ftp:"} {
+		if strings.HasPrefix(lc, p) {
+			return ""
+		}
+	}
+	// Already proxied.
+	if strings.HasPrefix(h, basePath+"/http") || strings.HasPrefix(h, basePath+"/https") {
+		return ""
+	}
+	parsed, err := url.Parse(h)
+	if err != nil {
+		return ""
+	}
+	abs := base.ResolveReference(parsed)
+	if abs.Scheme != "http" && abs.Scheme != "https" {
+		return ""
+	}
+	return basePath + "/" + abs.String()
+}
+
+// rewriteAnchorHrefs rewrites every <a href> and <area href> in the document
+// through the proxy. Uses goquery so it handles quoting variants, entities,
+// and preserves surrounding attributes. If parsing fails the body is returned
+// unchanged.
+func rewriteAnchorHrefs(body string, base *url.URL) string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+	if err != nil {
+		return body
+	}
+	changed := false
+	doc.Find("a[href], area[href]").Each(func(_ int, s *goquery.Selection) {
+		orig, ok := s.Attr("href")
+		if !ok {
+			return
+		}
+		rewritten := proxifyHref(orig, base)
+		if rewritten == "" {
+			return
+		}
+		s.SetAttr("href", rewritten)
+		changed = true
+	})
+	if !changed {
+		return body
+	}
+	out, err := doc.Html()
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func getenv(key, fallback string) string {
