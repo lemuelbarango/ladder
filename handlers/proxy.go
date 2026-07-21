@@ -377,11 +377,18 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 		resp.Header.Del("Content-Security-Policy")
 	}
 
-	// HTML-only transformations (applyRules + rewriteHtml) blow up non-HTML
-	// responses — XML sitemaps get their <?xml?> PI silently converted to a
-	// comment and the whole payload wrapped in <html><head><body> by
-	// goquery, JSON/CSS/JS get corrupted by the string-based `href="/`
-	// replacements. Content-Type sniffing keeps them intact.
+	// XML sitemaps and RSS/Atom feeds: rewrite navigation URLs so they
+	// route through the proxy. Doesn't parse the XML (which would break on
+	// PIs, CDATA, DOCTYPE, etc.); just targets the specific elements known
+	// to hold navigable URLs.
+	if isXMLResponse(resp) {
+		return rewriteXMLURLs(string(bodyB)), req, resp, nil
+	}
+
+	// HTML-only transformations (applyRules + rewriteHtml) blow up any other
+	// non-HTML response — JSON APIs get corrupted by the string-based
+	// `href="/` replacements, CSS/JS bodies get their content misinterpreted.
+	// Content-Type sniffing keeps them intact.
 	if !isHTMLResponse(resp) {
 		return string(bodyB), req, resp, nil
 	}
@@ -393,6 +400,59 @@ func fetchSite(urlpath string, queries map[string]string) (string, *http.Request
 	body := applyRules(string(bodyB), rule)
 	body = rewriteHtml([]byte(body), u, rule)
 	return body, req, resp, nil
+}
+
+// isXMLResponse reports whether the response's Content-Type indicates an
+// XML-family payload (sitemap, RSS, Atom, generic XML). Used to route into
+// the XML URL rewriter instead of the HTML rewriter.
+func isXMLResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		return false
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	switch ct {
+	case "application/xml", "text/xml",
+		"application/rss+xml", "application/atom+xml":
+		return true
+	}
+	// Custom subtypes ending in +xml (e.g. application/xml+sitemap, hCard's
+	// application/xrd+xml).  Exclude xhtml+xml — that goes through the HTML path.
+	if ct != "application/xhtml+xml" &&
+		strings.HasPrefix(ct, "application/") &&
+		strings.HasSuffix(ct, "+xml") {
+		return true
+	}
+	return false
+}
+
+// rewriteXMLURLs prepends the proxy prefix (basePath + "/") to absolute
+// http(s) URLs inside the well-known navigable elements of sitemaps and feeds:
+//
+//   - Sitemaps:  <loc>URL</loc>
+//   - RSS 2.0:   <link>URL</link>, <guid>URL</guid>
+//   - Atom:      <link href="URL"/>
+//
+// URLs in descriptive text (<title>, <description>, CDATA blocks that happen
+// to contain URLs) are deliberately not touched — those are content, not
+// navigation. Non-absolute URLs are left alone as well; resolving them would
+// require knowing the response URL and is out of scope here.
+var (
+	xmlURLTextRe  = regexp.MustCompile(`(<(?:loc|link|guid)\b[^>]*>\s*)(https?://[^\s<]+)`)
+	xmlLinkHrefRe = regexp.MustCompile(`(<link\b[^>]*\bhref=["'])(https?://[^"'\s>]+)(["'])`)
+)
+
+func rewriteXMLURLs(body string) string {
+	prefix := basePath + "/"
+	body = xmlURLTextRe.ReplaceAllString(body, "${1}"+prefix+"${2}")
+	body = xmlLinkHrefRe.ReplaceAllString(body, "${1}"+prefix+"${2}${3}")
+	return body
 }
 
 // isHTMLResponse reports whether the response's Content-Type indicates an
